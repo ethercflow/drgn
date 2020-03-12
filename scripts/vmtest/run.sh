@@ -219,9 +219,30 @@ set_nocow() {
 	chattr +C "$@" >/dev/null 2>&1 || true
 }
 
-cp_img() {
-	set_nocow "$2"
-	cp --reflink=auto "$1" "$2"
+create_rootfs_dir() {
+	local path="$1"
+	local parent
+
+	parent="$(dirname "$path")"
+	if [[ $parent != . ]]; then
+		mkdir -p "$parent"
+	fi
+	btrfs subvolume create "$path" > /dev/null 2>&1 || mkdir "$path"
+}
+
+remove_rootfs_dir() {
+	local path="$1"
+	if [[ ! -e "$path" ]]; then
+		return
+	fi
+	btrfs subvolume delete "$path" > /dev/null 2>&1 || rm -rf "$path"
+}
+
+copy_rootfs_dir() {
+	local src="$1"
+	local dst="$2"
+	btrfs subvolume snapshot "$src" "$dst" > /dev/null 2>&1 ||
+		cp -a "$src" "$dst"
 }
 
 create_rootfs_img() {
@@ -234,8 +255,8 @@ create_rootfs_img() {
 download_rootfs() {
 	local rootfsversion="$1"
 	local dir="$2"
-	download "drgn-vmtest-rootfs-$rootfsversion.tar.zst" |
-		zstd -d | sudo tar -C "$dir" -x
+	download "drgn-vmtest-rootfs-$rootfsversion.tar.zst" | zstd -d |
+		tar -C "$dir" -x
 }
 
 if (( LIST )); then
@@ -278,17 +299,10 @@ echo "Disk image: $IMG" >&2
 tmp=
 ARCH_DIR="$DIR/x86_64"
 mkdir -p "$ARCH_DIR"
-mnt="$(mktemp -d -p "$DIR" mnt.XXXXXXXXXX)"
 
 cleanup() {
 	if [[ -n $tmp ]]; then
 		rm -f "$tmp" || true
-	fi
-	if mountpoint -q "$mnt"; then
-		sudo umount "$mnt" || true
-	fi
-	if [[ -d "$mnt" ]]; then
-		rmdir "$mnt" || true
 	fi
 }
 trap cleanup EXIT
@@ -307,36 +321,26 @@ fi
 
 # Mount and set up the rootfs image.
 if (( ONESHOT )); then
-	rm -f "$IMG"
-	create_rootfs_img "$IMG"
-	sudo mount -o loop "$IMG" "$mnt"
-	download_rootfs "$ROOTFSVERSION" "$mnt"
+	false
 else
 	if (( ! SKIPIMG )); then
-		rootfs_img="$ARCH_DIR/drgn-vmtest-rootfs-$ROOTFSVERSION.img"
+		rootfs_dir="$ARCH_DIR/drgn-vmtest-rootfs-$ROOTFSVERSION"
 
-		if [[ ! -e $rootfs_img ]]; then
-			tmp="$(mktemp "$rootfs_img.XXX.part")"
-			set_nocow "$tmp"
-			truncate -s 2G "$tmp"
-			mkfs.ext4 -q "$tmp"
-			sudo mount -o loop "$tmp" "$mnt"
-
-			download_rootfs "$ROOTFSVERSION" "$mnt"
-
-			sudo umount "$mnt"
-			mv "$tmp" "$rootfs_img"
-			tmp=
+		if [[ ! -e $rootfs_dir ]]; then
+			# TODO: do this in a temp dir first (and move it into
+			# place BEFORE the set ro).
+			create_rootfs_dir "$rootfs_dir"
+			download_rootfs "$ROOTFSVERSION" "$rootfs_dir"
+			btrfs property set -ts "$rootfs_dir" ro true > /dev/null 2>&1
 		fi
 
-		rm -f "$IMG"
-		cp_img "$rootfs_img" "$IMG"
+		remove_rootfs_dir "$IMG"
+		copy_rootfs_dir "$rootfs_dir" "$IMG"
 	fi
-	sudo mount -o loop "$IMG" "$mnt"
 fi
 
 # Install vmlinux.
-vmlinux="$mnt/boot/vmlinux-$KERNELRELEASE"
+vmlinux="$IMG/boot/vmlinux-$KERNELRELEASE"
 if [[ -v BUILDDIR || $ONESHOT -eq 0 ]]; then
 	if [[ -v BUILDDIR ]]; then
 		source_vmlinux="$BUILDDIR/vmlinux"
@@ -350,13 +354,9 @@ if [[ -v BUILDDIR || $ONESHOT -eq 0 ]]; then
 		fi
 	fi
 	echo "Copying vmlinux..." >&2
-	sudo rsync -cp --chmod 0644 "$source_vmlinux" "$vmlinux"
+	rsync -cp --chmod 0644 "$source_vmlinux" "$vmlinux"
 else
-	# We could use "sudo zstd -o", but let's not run zstd as root with
-	# input from the internet.
-	download "vmlinux-$KERNELRELEASE.zst" |
-		zstd -d | sudo tee "$vmlinux" > /dev/null
-	sudo chmod 644 "$vmlinux"
+	false
 fi
 
 if (( SKIPSOURCE )); then
@@ -367,11 +367,11 @@ else
 	echo "Copying source files..." >&2
 
 	# Copy the source files in.
-	sudo mkdir -p -m 0755 "$mnt/drgn"
-	sudo rsync --files-from=drgn.egg-info/SOURCES.txt -cpt . "$mnt/drgn"
+	mkdir -p -m 0755 "$IMG/drgn"
+	rsync --files-from=drgn.egg-info/SOURCES.txt -cpt . "$IMG/drgn"
 
 	# Create the init scripts.
-	sudo tee "$mnt/etc/rcS.d/S50-run-tests" > /dev/null << "EOF"
+	cat << "EOF" > "$IMG/etc/rcS.d/S50-run-tests"
 #!/bin/sh
 
 # Force the Linux helper tests to run and fail if they would be skipped
@@ -381,30 +381,27 @@ cd /drgn && python3 --version && python3 setup.py build test
 echo $? > /exitstatus
 chmod 644 /exitstatus
 EOF
-	sudo chmod 755 "$mnt/etc/rcS.d/S50-run-tests"
+	chmod 755 "$IMG/etc/rcS.d/S50-run-tests"
 
-	sudo tee "$mnt/etc/rcS.d/S99-poweroff" > /dev/null << "EOF"
+	cat << "EOF" > "$IMG/etc/rcS.d/S99-poweroff"
 #!/bin/sh
 
 poweroff
 EOF
-	sudo chmod 755 "$mnt/etc/rcS.d/S99-poweroff"
+	chmod 755 "$IMG/etc/rcS.d/S99-poweroff"
 fi
-
-sudo umount "$mnt"
 
 echo "Starting virtual machine..." >&2
 qemu-system-x86_64 -nodefaults -display none -serial mon:stdio \
 	-cpu kvm64 -enable-kvm -smp "$(nproc)" -m 2G \
-	-drive file="$IMG",format=raw,index=1,media=disk,if=virtio,cache=none \
-	-kernel "$vmlinuz" -append "root=/dev/vda rw console=ttyS0,115200$APPEND"
+	-virtfs local,path="$IMG",id=root,mount_tag=/dev/root,security_model=none \
+	-kernel "$vmlinuz" \
+	-append "rootfstype=9p rootflags=trans=virtio,cache=fscache,msize=262144 rw console=ttyS0,115200$APPEND"
 
-sudo mount -o loop "$IMG" "$mnt"
-if exitstatus="$(cat "$mnt/exitstatus" 2>/dev/null)"; then
+if exitstatus="$(cat "$IMG/exitstatus" 2>/dev/null)"; then
 	printf '\nTests exit status: %s\n' "$exitstatus" >&2
 else
 	printf '\nCould not read tests exit status\n' >&2
 	exitstatus=1
 fi
-sudo umount "$mnt"
 exit "$exitstatus"
